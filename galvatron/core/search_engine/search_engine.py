@@ -15,6 +15,11 @@ from galvatron.utils import (
     num2str
 )
 from scipy.optimize import curve_fit
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.text import Text
+from rich.columns import Columns
 from .cost_model import pipeline_costmodel
 from .cost_model import MemoryCostModel, TimeCostModel
 from .dynamic_programming import DpOnModel
@@ -40,6 +45,38 @@ class GalvatronSearchEngine():
         self.model_type = 'gpt'
         self.optimal_chunk_func = optimal_chunk_func_default
         self.memory_constraint = args.memory_constraint * 1024
+        
+        # Initialize attributes that will be set by methods
+        self.path = None
+        self.hiddensize_list = None
+        self.layernum_list = None
+        self.seqlen_list = None
+        self.num_layertype = None
+        self.other_time_profiled_list = None
+        
+        # Hardware configuration attributes
+        self.allreduce_bandwidth = None
+        self.allreduce_comm_coe = None
+        self.p2p_bandwidth = None
+        self.p2p_comm_coe = None
+        self.overlap_coe = None
+        self.sp_allreduce = None
+        self.sp_all2all = None
+        
+        # Cost model attributes
+        self.model_args_list = None
+        self.train_args_list = None
+        self.parallel_args_list = None
+        self.profile_model_args_list = None
+        self.profile_hardware_args_list = None
+        
+        # Search attributes
+        self.search_history = None
+        self.min_bsz = None
+        self.max_bsz = None
+        self.bsz_scale = None
+        self.BSZs = None
+        self.strategies = None
         
     # =============== Setting Galvatron Search Engine Basic Information ===============
     def set_search_engine_info(self, path, model_layer_configs, model_name):
@@ -86,7 +123,7 @@ class GalvatronSearchEngine():
         return self.time_path
     
     def set_microbatch_func(self, microbatch_size, max_chunk):
-        self.optimal_chunk_func = lambda local_bsz, strategy: optimal_chunk_func_default(local_bsz, strategy, microbatch_size)
+        self.optimal_chunk_func = lambda local_bsz, strategy, mbsz, min_tp: optimal_chunk_func_default(local_bsz, strategy, microbatch_size, min_tp)
     
     def set_model_layer_configs(self, model_layer_configs):
         if model_layer_configs is None:
@@ -99,6 +136,7 @@ class GalvatronSearchEngine():
     # =============== Initializing Galvatron Search Engine ===============
     # Generating Strategies, Loading Profiled Memory & Time Config, Setting Memory & Time Cost Models
     def initialize_search_engine(self):
+        # [pp_deg, tp_deg, dp_deg, {options}]
         self.generate_strategies()
         self.get_profiled_model_configs()
         self.get_profiled_hardware_configs()
@@ -910,58 +948,122 @@ class GalvatronSearchEngine():
         return strategies
     
     def show_search_info(self):
-        print('================================================================================')
-        print('--- Optimization Configs ----')
-        print('Memory constraint: %d GB'%self.args.memory_constraint)
-        print('Pipeline Type:', self.args.pipeline_type)
-        print('Default DP Type:', self.args.default_dp_type)
-        print('Mixed Precision:', self.args.mixed_precision)
-        # if self.args.embed_sdp:
-        #     print('Embedding SDP: ON')
-        print('Search Space:')
-        print_strategies(self.strategies)
-        print('================================================================================')
-        print('---- Environment Configs ----')
-        print('Allreduce Bandwidth (GB/s):', self.allreduce_bandwidth)
-        print('Allreduce Communication Coefficient (ms/MB):', self.allreduce_comm_coe)
-        print('P2P Bandwidth (GB/s):', self.p2p_bandwidth)
-        print('P2P Communication Coefficient (ms/MB):', self.p2p_comm_coe)
-        print('Overlap coefficient:', self.overlap_coe)
-        print('================================================================================')
-        print('------- Model Configs -------')
-        print('Model Name:', self.model_name)
-        print('Num layertype:', self.num_layertype)
-        print('Layer_num:', self.layernum_list)
-        print('Hidden_size:', self.hiddensize_list)
-        print('Seq_len:', self.seqlen_list)
-        print('================================================================================')
-        print('--- Model Computation Configs ---')
-        print('Forward computation time:', self.time_profiled_list)
-        print('================================================================================')
-        print('--- Model Memory Configs ---')
-        print('Parameter Memory Cost:', self.param_sizes)
-        print('Activation Memory Cost of Different TP degree (per bsz):')
-        print(self.act_sizes)
-        print('Other Memory Cost (pp = 1):')
-        print(self.other_memory_pp_off)
-        print('Other Memory Cost (pp > 1):')
-        print(self.other_memory_pp_on)
-        print('================================================================================')
-        print('Model Args List:')
-        print(self.model_args_list)
-        print('================================================================================')
-        print('Train Args List:')
-        print(self.train_args_list)
-        print('================================================================================')
-        print('Parallel Args List:')
-        print(self.parallel_args_list)
-        print('================================================================================')
-        print('Profile Model Args List:')
-        print(self.profile_model_args_list)
-        print('================================================================================')
-        print('Profile Hardware Args List:')
-        print(self.profile_hardware_args_list)
-        print('================================================================================')
+        console = Console()
+        
+        # Create title
+        title = Text("🚀 Galvatron Search Engine Configuration", style="bold cyan")
+        console.print(Panel(title, border_style="cyan"))
+        
+        # Optimization Configs Section
+        opt_table = Table(title="⚙️ Optimization Configs", title_style="bold blue", border_style="blue")
+        opt_table.add_column("Configuration", style="cyan", width=20)
+        opt_table.add_column("Value", style="white")
+        
+        opt_table.add_row("Memory Constraint", f"{self.args.memory_constraint} GB")
+        opt_table.add_row("Pipeline Type", self.args.pipeline_type)
+        opt_table.add_row("Default DP Type", self.args.default_dp_type)
+        opt_table.add_row("Mixed Precision", self.args.mixed_precision)
+        
+        console.print(opt_table)
+        console.print()
+        
+        # Search Space Section
+        search_panel = Panel.fit(
+            f"[bold yellow]Search Space Strategies:[/bold yellow]\n[dim]Total strategies: {len(self.strategies)}[/dim]",
+            border_style="yellow"
+        )
+        console.print(search_panel)
+        
+        # Environment Configs Section  
+        env_table = Table(title="🌐 Environment Configs", title_style="bold green", border_style="green")
+        env_table.add_column("Hardware Metric", style="cyan", width=25)
+        env_table.add_column("Value", style="white")
+        
+        env_table.add_row("Allreduce Bandwidth", f"{self.allreduce_bandwidth} GB/s")
+        env_table.add_row("Allreduce Comm Coefficient", f"{self.allreduce_comm_coe} ms/MB")
+        env_table.add_row("P2P Bandwidth", f"{self.p2p_bandwidth} GB/s") 
+        env_table.add_row("P2P Comm Coefficient", f"{self.p2p_comm_coe} ms/MB")
+        env_table.add_row("Overlap Coefficient", str(self.overlap_coe))
+        
+        console.print(env_table)
+        console.print()
+        
+        # Model Configs Section
+        model_table = Table(title="🤖 Model Configs", title_style="bold magenta", border_style="magenta")
+        model_table.add_column("Model Property", style="cyan", width=20)
+        model_table.add_column("Value", style="white")
+        
+        model_table.add_row("Model Name", str(self.model_name))
+        model_table.add_row("Num Layertype", str(self.num_layertype))
+        model_table.add_row("Layer Numbers", str(self.layernum_list))
+        model_table.add_row("Hidden Sizes", str(self.hiddensize_list))
+        model_table.add_row("Sequence Lengths", str(self.seqlen_list))
+        
+        console.print(model_table)
+        console.print()
+        
+        # Model Computation Configs
+        comp_panel = Panel.fit(
+            f"[bold red]⚡ Model Computation Configs[/bold red]\n"
+            f"Forward computation time: {self.time_profiled_list}",
+            border_style="red"
+        )
+        console.print(comp_panel)
+        console.print()
+        
+        # Model Memory Configs
+        mem_table = Table(title="💾 Model Memory Configs", title_style="bold yellow", border_style="yellow")
+        mem_table.add_column("Memory Component", style="cyan", width=25)
+        mem_table.add_column("Details", style="white")
+        
+        mem_table.add_row("Parameter Memory Cost", str(self.param_sizes))
+        mem_table.add_row("Activation Memory (per bsz)", str(self.act_sizes))
+        mem_table.add_row("Other Memory (pp=1)", str(self.other_memory_pp_off))
+        mem_table.add_row("Other Memory (pp>1)", str(self.other_memory_pp_on))
+        
+        console.print(mem_table)
+        console.print()
+        
+        # Detailed Args sections (collapsed by default)
+        args_panels = []
+        
+        args_panels.append(Panel(
+            f"Model Args: {self.model_args_list}",
+            title="📊 Model Args List",
+            border_style="dim blue"
+        ))
+        
+        args_panels.append(Panel(
+            f"Train Args: {self.train_args_list}",
+            title="🏋️ Train Args List", 
+            border_style="dim green"
+        ))
+        
+        args_panels.append(Panel(
+            f"Parallel Args: {self.parallel_args_list}",
+            title="⚡ Parallel Args List",
+            border_style="dim magenta"
+        ))
+        
+        args_panels.append(Panel(
+            f"Profile Model Args: {self.profile_model_args_list}",
+            title="📈 Profile Model Args List",
+            border_style="dim red"
+        ))
+        
+        args_panels.append(Panel(
+            f"Profile Hardware Args: {self.profile_hardware_args_list}",
+            title="🔧 Profile Hardware Args List",
+            border_style="dim yellow"
+        ))
+        
+        for panel in args_panels:
+            console.print(panel)
+            console.print()
+        
+        # Footer
+        footer = Text("✅ Configuration Summary Complete", style="bold green")
+        console.print(Panel(footer, border_style="green"))
 
 
 # ========================== Pipeline Division & Pipeline Cost Utils ==========================

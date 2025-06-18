@@ -443,12 +443,371 @@ class GalvatronSearchEngine:
 
         return max_throughput
     
-    # Include other necessary methods from the original class...
-    # (Copy the remaining methods that are needed for the core functionality)
+    def set_searching_bsz(self):
+        """Set searching batch sizes based on arguments."""
+        args = self.args
+        # Set Searching BSZs
+        if args.settle_bsz is not None and args.settle_bsz > 0:
+            self.min_bsz = self.max_bsz = args.settle_bsz
+            self.bsz_scale = 0
+            self.BSZs = [args.settle_bsz]
+            print('-----', '[Searching Batch Sizes Info]', 'Settle bsz:', args.settle_bsz, '-----')
+            return
+        self.bsz_scale = args.bsz_scale
+
+        if args.recommend_min_bsz:
+            recommend_bsz = self.recommend_min_bsz(self.bsz_scale)
+            args.min_bsz = recommend_bsz if recommend_bsz > 0 else args.min_bsz
+        
+        self.min_bsz = max(args.min_bsz, self.bsz_scale)
+        self.min_bsz = self.min_bsz // self.bsz_scale * self.bsz_scale
+        self.max_bsz = int(np.ceil(args.max_bsz / self.bsz_scale) * self.bsz_scale) if args.max_bsz % self.bsz_scale else (args.max_bsz+self.bsz_scale)
+        self.BSZs = list(range(self.min_bsz, self.max_bsz, self.bsz_scale))
+        self.max_bsz = self.BSZs[-1]
+        print('-----', '[Searching Batch Sizes Info]', 'Min bsz:', self.min_bsz, 'Max bsz:', self.max_bsz, 'bsz_scale:', self.bsz_scale, '-----')
+
+    def recommend_min_bsz(self, scale):
+        """Recommend minimum batch size based on baseline strategies."""
+        prune_percent = 0.65
+        args = self.args
+        gpu_num = args.gpu_num
+        if not args.search_space in ['full', 'dp+pp', 'dp+tp']:
+            return -1
+        baselines = []
+        if not args.disable_dp:
+            baselines.append([1,1,gpu_num,{'fsdp':0}])
+        if not args.disable_sdp:
+            baselines.append([1,1,gpu_num,{'fsdp':1}])
+        if not args.disable_tp:
+            baselines.append([1,gpu_num,1,{'fsdp':0}])
+        max_bsz_baselines = [self.estimate_strategy_max_bsz([s], scale) for s in baselines]
+        max_bsz, min_bsz = np.max(max_bsz_baselines), np.min(max_bsz_baselines)
+        bsz_start = int((min_bsz*(1-prune_percent)+max_bsz*prune_percent)//scale*scale)
+        bsz_start = bsz_start if bsz_start > scale else scale
+        return bsz_start
+
+    def estimate_strategy_max_bsz(self, strategies, scale):
+        """Estimate maximum batch size for given strategies."""
+        max_bsz = 0
+        bsz = scale
+        while True:
+            from .search_engine import get_pp_stage_for_bsz
+            pp_stage_dict = get_pp_stage_for_bsz(strategies, self.model_args_list, self.train_args_list, self.parallel_args_list, self.profile_model_args_list, self.layernum_list, bsz)
+            dp_on_model = DpOnModel(strategies, MemoryCostModel, TimeCostModel, 
+                                    model_args_list=self.model_args_list, train_args_list=self.train_args_list,
+                                    parallel_args_list=self.parallel_args_list, profile_model_args_list=self.profile_model_args_list,
+                                    profile_hardware_args_list=self.profile_hardware_args_list,
+                                    max_mem=self.memory_constraint, layer_num=self.layernum_list, sequence_len = self.seqlen_list, 
+                                    multi_layer_type = True, pp_stage_dict = pp_stage_dict,
+                                    comm_coe_dict=self.allreduce_comm_coe, gpu_num=self.args.gpu_num,
+                                    config = self.args)
+            min_cost, min_res_list, min_pp_deg, mem_remain, mem_cost, min_vtp = dp_on_model.fit(bsz, 1, 1, 0, 1, print_=False, mbsz_dict = {1:bsz})
+            if min_pp_deg == -1:
+                max_bsz = bsz - scale
+                break
+            bsz += scale
+        return max_bsz
+
+    def dynamic_programming(self, strategies, bsz, chunk, mbsz_dict, pp_stage_dict, min_tp, max_tp, vsp, embed_sdp, sp_search, logger):
+        """Execute dynamic programming optimization."""
+        args = self.args
+        logger.info(f'bsz={bsz} {pp_stage_dict}')
+        dp_on_model = DpOnModel(strategies, 
+                                MemoryCostModel, 
+                                TimeCostModel, 
+                                model_args_list=self.model_args_list,
+                                train_args_list=self.train_args_list,
+                                parallel_args_list=self.parallel_args_list,
+                                profile_model_args_list=self.profile_model_args_list,
+                                profile_hardware_args_list=self.profile_hardware_args_list,
+                                max_mem=self.memory_constraint,
+                                layer_num=self.layernum_list,
+                                sequence_len = self.seqlen_list,
+                                multi_layer_type = True,
+                                pp_stage_dict = pp_stage_dict,
+                                search_history=self.search_history,
+                                comm_coe_dict=self.allreduce_comm_coe,
+                                gpu_num=args.gpu_num,
+                                model_microbatch_after_dp=args.use_pipeline_costmodel,
+                                pipeline_type=args.pipeline_type,
+                                config = self.args,
+                                logger=logger)
+        
+        logger.info(f"****Searching with bsz={bsz} chunk={chunk} min_tp={min_tp} max_tp={max_tp} vsp={vsp} embed_sdp={embed_sdp} sp_search={sp_search}****")
+        from .search_engine import check_optimal_chunks
+        chunk_dict = check_optimal_chunks(args.gpu_num, strategies, self.optimal_chunk_func, bsz, mbsz_dict, min_tp)
+        logger.info(f'Chunk_dict for bsz {bsz}: {chunk_dict}')
+        logger.info(f'Mbsz_dict for bsz {bsz}: {mbsz_dict}')
+        
+        min_cost, min_res_list, min_pp_deg, mem_remain, mem_cost, min_vtp = dp_on_model.fit(bsz, min_tp, max_tp, vsp, embed_sdp, sp_search, mbsz_dict = mbsz_dict)
+        throughput = bsz / min_cost
+        logger.info(f"[Optimal pp_deg={min_pp_deg}] Minimized timecost={min_cost} Memory remaining={mem_remain} Memory cost={mem_cost} Vocab tp={min_vtp}")
+        logger.info(f"Max throughput={throughput} samples/s")
+        print_strategies(min_res_list, logger)
+        result = {'min_cost': min_cost, 'min_res_list': min_res_list, 'min_pp_deg': min_pp_deg, 
+                        'mem_remain': mem_remain, 'mem_cost': mem_cost, 'throughput': throughput, "vtp": min_vtp}
+        return result
+
+    def save_results(self, results, bsz, chunk, pp_stage_dict):
+        """Save optimization results to configuration file."""
+        re, optimal_bsz = results, bsz
+        args = self.args
+        if re['min_pp_deg'] > 0 and re['min_res_list'] is not None:
+            result_strategy = []
+            if isinstance(re['min_res_list'],list) and isinstance(re['min_res_list'][0],list) and isinstance(re['min_res_list'][0][0],list):
+                for l in re['min_res_list']:
+                    result_strategy += l
+            else:
+                result_strategy = re['min_res_list']
+            
+            config = strategy2config(result_strategy)
+            config['checkpoint'] = array2str([1 if 'cpt' in s[-1] and s[-1]['cpt'] else 0 for s in result_strategy])
+            config['global_bsz'] = optimal_bsz
+            config['chunks'] = chunk
+            config['pp_division'] = array2str(pp_stage_dict[config['pp_deg']])
+            config['pipeline_type'] = args.pipeline_type
+            config['default_dp_type'] = args.default_dp_type
+            config['vtp'] = re['vtp']
+            config['vsp'] = re['vsp']
+            config['embed_sdp'] = re['embed_sdp']
+            
+            # Use path manager to get output path
+            config_path = self.path_manager.get_output_config_path(self.memory_constraint)
+            print(config_path)
+            write_json_config(config, config_path)
+            print('Already written optimized parallelism config into galvatron config file %s!'%(config_path))
+
+    def generate_strategies(self):
+        """Generate parallelization strategies."""
+        args = self.args
+        gpu_num = args.gpu_num
+        strategies = self.generate_dp_tp_pp_sdp()
+        if args.search_space == 'dp+tp':
+            args.disable_sdp = 1
+            args.disable_pp = 1
+        elif args.search_space == 'dp+pp':
+            args.disable_sdp = 1
+            args.disable_tp = 1
+        elif args.search_space == '3d':
+            args.disable_sdp = 1
+        if args.search_space in ['3d', 'dp', 'tp', 'pp', 'sdp']:
+            self.strategies = strategies
+            args.disable_ckpt = 1
+            return strategies
+        strategies_new = []
+        assert(not(args.disable_sdp and args.disable_dp))
+        for s in strategies:
+            if args.disable_dp and s[2] > 1 and 'fsdp' in s[-1] and s[-1]['fsdp'] == 0:
+                continue
+            if args.disable_sdp and s[2] > 1 and 'fsdp' in s[-1] and s[-1]['fsdp'] == 1:
+                continue
+            if args.disable_tp and s[1] > 1:
+                continue
+            if args.disable_pp and s[0] > 1:
+                continue
+            if args.disable_tp_consec and 'tp' in s[-1] and s[-1]['tp'] == 0:
+                continue
+            if s[1] > args.max_tp_deg:
+                continue
+            if s[0] > args.max_pp_deg:
+                continue
+            strategies_new.append(s)
+        strategies = strategies_new
+
+        if not args.disable_ckpt:
+            strategies_cpt = []
+            for s in strategies:
+                s_cpt = copy.deepcopy(s)
+                s_cpt[-1]['cpt']=1
+                strategies_cpt.append(s_cpt)
+            strategies += strategies_cpt
+        self.strategies = strategies
+        return strategies
+    
+    def generate_dp_tp_pp_sdp(self, gpu_num=None, search_space=None):
+        """Generate DP, TP, PP, SDP strategies."""
+        args = self.args
+        gpu_num = args.gpu_num if gpu_num is None else gpu_num
+        search_space = args.search_space if search_space is None else search_space
+        i, total = 1, []
+        while i<=gpu_num:
+            total.append(i)
+            i *= 2
+        if args.search_space == 'full':
+            strategies = []
+            for pp in total:
+                for tp in total:
+                    if pp*tp<=gpu_num:
+                        dp = gpu_num // (pp * tp) 
+                        if tp==1 or tp == gpu_num/pp:
+                            if dp == 1:
+                                strategies.append([pp,tp,dp,{}])
+                            else:
+                                strategies.append([pp,tp,dp,{'fsdp':0}])
+                                strategies.append([pp,tp,dp,{'fsdp':1}])
+                        else:
+                            strategies.append([pp,tp,dp,{'tp':0,'fsdp':0}])
+                            strategies.append([pp,tp,dp,{'tp':0,'fsdp':1}])
+                            strategies.append([pp,tp,dp,{'tp':1,'fsdp':0}])
+                            strategies.append([pp,tp,dp,{'tp':1,'fsdp':1}])
+        elif args.search_space == 'dp+tp':
+            strategies = []
+            pp = 1
+            for tp in total:
+                if pp*tp<=gpu_num:
+                    dp = gpu_num // (pp * tp) 
+                    if tp==1 or tp == gpu_num/pp:
+                        if dp == 1:
+                            strategies.append([pp,tp,dp,{}])
+                        else:
+                            strategies.append([pp,tp,dp,{'fsdp':0}])
+                    else:
+                        strategies.append([pp,tp,dp,{'tp':0,'fsdp':0}])
+                        strategies.append([pp,tp,dp,{'tp':1,'fsdp':0}])
+        elif args.search_space == 'dp+pp':
+            strategies = []
+            tp = 1
+            for pp in total:
+                if pp*tp<=gpu_num:
+                    dp = gpu_num // (pp * tp) 
+                    if tp==1 or tp == gpu_num/pp:
+                        if dp == 1:
+                            strategies.append([pp,tp,dp,{}])
+                        else:
+                            strategies.append([pp,tp,dp,{'fsdp':0}])
+                    else:
+                        strategies.append([pp,tp,dp,{'tp':0,'fsdp':0}])
+                        strategies.append([pp,tp,dp,{'tp':1,'fsdp':0}])
+        elif args.search_space == '3d':
+            strategies = [[2,2,gpu_num//4,{'tp':1,'fsdp':0}]]
+        elif args.search_space == 'dp':
+            strategies = [[1,1,gpu_num,{'fsdp':0}]]
+        elif args.search_space == 'sdp':
+            strategies = [[1,1,gpu_num,{'fsdp':1}]]
+        elif args.search_space == 'tp':
+            strategies = [[1,args.max_tp_deg,gpu_num//args.max_tp_deg,{'fsdp':0}]]
+            if strategies[0][2] > 1:
+                strategies[0][-1]['tp'] = 1
+        elif args.search_space == 'pp':
+            strategies = [[args.max_pp_deg,1,gpu_num//args.max_pp_deg,{'fsdp':0}]]
+        
+        if args.sp_space == 'tp':
+            for strategie in strategies:
+                if strategie[1] > 1:
+                    strategie[-1]['sp'] = 0
+        elif args.sp_space == 'sp':
+            for strategie in strategies:
+                if strategie[1] > 1:
+                    strategie[-1]['sp'] = 1
+        elif args.sp_space == 'tp+sp':
+            new_strategies = []
+            for strategie in strategies:
+                if strategie[1] > 1:
+                    strategie[-1]['sp'] = 0
+                    new_strategies.append(copy.deepcopy(strategie))
+                    strategie[-1]['sp'] = 1
+                    new_strategies.append(copy.deepcopy(strategie))
+                else:
+                    new_strategies.append(copy.deepcopy(strategie))
+            return new_strategies
+        return strategies
+
+    def show_search_info(self):
+        """Display search engine configuration information."""
+        console = Console()
+        
+        # Create title
+        title = Text("🚀 Galvatron Search Engine Configuration", style="bold cyan")
+        console.print(Panel(title, border_style="cyan"))
+        
+        # Optimization Configs Section
+        opt_table = Table(title="⚙️ Optimization Configs", title_style="bold blue", border_style="blue")
+        opt_table.add_column("Configuration", style="cyan", width=20)
+        opt_table.add_column("Value", style="white")
+        
+        opt_table.add_row("Memory Constraint", f"{self.args.memory_constraint} GB")
+        opt_table.add_row("Pipeline Type", self.args.pipeline_type)
+        opt_table.add_row("Default DP Type", self.args.default_dp_type)
+        opt_table.add_row("Mixed Precision", self.args.mixed_precision)
+        
+        console.print(opt_table)
+        console.print()
+        
+        # Search Space Section
+        search_panel = Panel.fit(
+            f"[bold yellow]Search Space Strategies:[/bold yellow]\n[dim]Total strategies: {len(self.strategies)}[/dim]",
+            border_style="yellow"
+        )
+        console.print(search_panel)
+        
+        # Environment Configs Section  
+        env_table = Table(title="🌐 Environment Configs", title_style="bold green", border_style="green")
+        env_table.add_column("Hardware Metric", style="cyan", width=25)
+        env_table.add_column("Value", style="white")
+        
+        env_table.add_row("Allreduce Bandwidth", f"{self.allreduce_bandwidth} GB/s")
+        env_table.add_row("Allreduce Comm Coefficient", f"{self.allreduce_comm_coe} ms/MB")
+        env_table.add_row("P2P Bandwidth", f"{self.p2p_bandwidth} GB/s") 
+        env_table.add_row("P2P Comm Coefficient", f"{self.p2p_comm_coe} ms/MB")
+        env_table.add_row("Overlap Coefficient", str(self.overlap_coe))
+        
+        console.print(env_table)
+        console.print()
+        
+        # Model Configs Section
+        model_table = Table(title="🤖 Model Configs", title_style="bold magenta", border_style="magenta")
+        model_table.add_column("Model Property", style="cyan", width=20)
+        model_table.add_column("Value", style="white")
+        
+        model_table.add_row("Model Name", str(getattr(self.args, 'model_name', 'Unknown')))
+        model_table.add_row("Num Layertype", str(self.num_layertype))
+        model_table.add_row("Layer Numbers", str(self.layernum_list))
+        model_table.add_row("Hidden Sizes", str(self.hiddensize_list))
+        model_table.add_row("Sequence Lengths", str(self.seqlen_list))
+        
+        console.print(model_table)
+        console.print()
+        
+        # Model Computation Configs
+        comp_panel = Panel.fit(
+            f"[bold red]⚡ Model Computation Configs[/bold red]\n"
+            f"Forward computation time: {self.time_profiled_list}",
+            border_style="red"
+        )
+        console.print(comp_panel)
+        console.print()
+        
+        # Model Memory Configs
+        mem_table = Table(title="💾 Model Memory Configs", title_style="bold yellow", border_style="yellow")
+        mem_table.add_column("Memory Component", style="cyan", width=25)
+        mem_table.add_column("Details", style="white")
+        
+        mem_table.add_row("Parameter Memory Cost", str(self.param_sizes))
+        mem_table.add_row("Activation Memory (per bsz)", str(self.act_sizes))
+        mem_table.add_row("Other Memory (pp=1)", str(self.other_memory_pp_off))
+        mem_table.add_row("Other Memory (pp>1)", str(self.other_memory_pp_on))
+        
+        console.print(mem_table)
+        console.print()
+        
+        # Footer
+        footer = Text("✅ Configuration Summary Complete", style="bold green")
+        console.print(Panel(footer, border_style="green"))
 
 
 # Import utility functions that were originally part of the main file
-from .search_engine import (
-    pp_division_memory_balanced, get_pp_stage_for_bsz, get_cost_all_stages,
-    get_layer_costs, pp_division_even, optimal_chunk_func_default, check_optimal_chunks
-)
+def optimal_chunk_func_default(local_bsz, strategy, microbatch_size, min_tp):
+    """Default optimal chunk function."""
+    import numpy as np
+    assert(strategy[1] % min_tp == 0)
+    local_bsz = local_bsz // (strategy[1] // min_tp)
+    chunk = np.ceil(local_bsz / microbatch_size)
+    chunk = 1 if chunk == 0 else chunk
+    return chunk
+
+
+# Import needed utility functions
+def get_pp_stage_for_bsz(strategies, model_args_list, train_args_list, parallel_args_list, profile_model_args_list, layer_num_list, bsz, mbsz_dict=None, single_layer_even=True):
+    """Import this function from the original search_engine module."""
+    from .search_engine import get_pp_stage_for_bsz as original_get_pp_stage_for_bsz
+    return original_get_pp_stage_for_bsz(strategies, model_args_list, train_args_list, parallel_args_list, profile_model_args_list, layer_num_list, bsz, mbsz_dict, single_layer_even)
